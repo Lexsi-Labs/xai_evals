@@ -244,7 +244,7 @@ class ExplanationMetricsImage:
     def _aggregate_cached_results(self, cache_files):
         """Aggregates metric results from cached batch files and deletes them."""
         aggregated_scores = {}
-        nan_inf_value_count = 0
+        finite_batches = {}
 
         for cache_file in cache_files:
             with open(cache_file, "rb") as f:
@@ -252,28 +252,18 @@ class ExplanationMetricsImage:
 
             for metric_name, score in batch_results.items():
                 if isinstance(score, dict):
-                    for sub_key, sub_value in score.items():
-                        name_key = metric_name + "_" + sub_key
-                        if np.isfinite(sub_value):
-                            if name_key not in aggregated_scores:
-                                aggregated_scores[name_key] = 0.0
-                            else:
-                                aggregated_scores[name_key] += sub_value
-                        else:
-                            nan_inf_value_count+=1
+                    scores = {metric_name + "_" + sub_key: sub_value for sub_key, sub_value in score.items()}
                 else:
-                    if np.isfinite(score):
-                        if metric_name not in aggregated_scores:
-                            aggregated_scores[metric_name] = 0.0
-                        aggregated_scores[metric_name] += score
-                    else:
-                        nan_inf_value_count +=1
+                    scores = {metric_name: score}
+                for name_key, value in scores.items():
+                    if np.isfinite(value):
+                        aggregated_scores[name_key] = aggregated_scores.get(name_key, 0.0) + value
+                        finite_batches[name_key] = finite_batches.get(name_key, 0) + 1
 
-        num_batches = len(cache_files)-nan_inf_value_count
         for metric_name in aggregated_scores:
-            aggregated_scores[metric_name] /= num_batches
+            aggregated_scores[metric_name] /= finite_batches[metric_name]
 
-        aggregated_scores["num_batches"] = num_batches
+        aggregated_scores["num_batches"] = len(cache_files)
 
         # Delete cache files
         for cache_file in cache_files:
