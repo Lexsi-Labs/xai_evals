@@ -605,13 +605,20 @@ class ExplanationMetricsTabular:
     def _generate_noise(self, shape, epsilon=1e-2):
         return np.random.normal(0, epsilon, size=shape)
 
+    def _feature_attributions(self, attributions):
+        """Attributions in X_test column order; explainers rank their rows by importance."""
+        # SHAP and LIME rename spaces to underscores, and LIME only returns its top features.
+        feature_names = pd.Series(self.features).str.replace(' ', '_')
+        ranked = attributions.assign(Feature=attributions['Feature'].str.replace(' ', '_'))
+        return ranked.set_index('Feature')['Attribution'].reindex(feature_names).fillna(0).values
+
     def _infidelity(self, attributions_list, epsilon=1e-2):
         infidelity_scores = []
         for i in range(self.start_idx, self.end_idx):
             x = self.X_test[i:i+1]
             noise = self._generate_noise(x.shape, epsilon=epsilon)[0]
-            g_x = attributions_list[i - self.start_idx]['Attribution'].values
-            
+            g_x = self._feature_attributions(attributions_list[i - self.start_idx])
+
             f_x = self._predict(x)[0]
             f_x_pert = self._predict((x + noise))[0]
 
@@ -627,10 +634,10 @@ class ExplanationMetricsTabular:
             x = self.X_test[i:i+1]
             noise = self._generate_noise(x.shape, epsilon=epsilon)
             perturbed_x = (x + noise).astype(x.dtype)
-            old_attr = attributions_list[i - self.start_idx]['Attribution'].values
+            old_attr = self._feature_attributions(attributions_list[i - self.start_idx])
 
             new_explanation = self.explainer.explain(perturbed_x, instance_idx=0)
-            new_attr = new_explanation['Attribution'].values
+            new_attr = self._feature_attributions(new_explanation)
 
             sensitivity_scores.append(np.linalg.norm(old_attr - new_attr))
         return np.mean(sensitivity_scores)
@@ -638,7 +645,7 @@ class ExplanationMetricsTabular:
     def _comprehensiveness(self, attributions_list, k=5):
         comprehensiveness_scores = []
         for i in range(self.start_idx, self.end_idx):
-            attrs = attributions_list[i - self.start_idx]['Attribution'].values
+            attrs = self._feature_attributions(attributions_list[i - self.start_idx])
             top_k_indices = np.argsort(np.abs(attrs))[-k:]
 
             x = self.X_test[i].copy()
@@ -653,7 +660,7 @@ class ExplanationMetricsTabular:
     def _sufficiency(self, attributions_list, k=5):
         sufficiency_scores = []
         for i in range(self.start_idx, self.end_idx):
-            attrs = attributions_list[i - self.start_idx]['Attribution'].values
+            attrs = self._feature_attributions(attributions_list[i - self.start_idx])
             top_k_indices = np.argsort(np.abs(attrs))[-k:]
 
             x = self.X_test[i]
@@ -684,7 +691,7 @@ class ExplanationMetricsTabular:
         faithfulness_scores = []
         for i in range(self.start_idx, self.end_idx):
             f_x = self._predict(self.X_test[i:i+1])[0]
-            attribution_values = attributions_list[i - self.start_idx]['Attribution'].values
+            attribution_values = self._feature_attributions(attributions_list[i - self.start_idx])
 
             for j, a_j in enumerate(attribution_values):
                 x_pert = self.X_test[i].copy()
