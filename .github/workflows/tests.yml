@@ -4,6 +4,10 @@
 #   tests/test_metrics.py, tests/test_explainer.py - import the package
 #     `aryaxai_xai_metrics_tabular`, which no longer exists (now `xai_evals`).
 #
+# Stubbed: `dl_backtrace` (the installed release has no `tf_backtrace` module
+#   and its compiled CUDA extension fails to load against the pinned torch).
+#   The tests do not use it, so an empty stand-in package is put on PYTHONPATH.
+#
 # Extra install: `cachetools` is needed by quantus but missing from
 # requirements.txt, so it is installed here.
 name: Tests
@@ -35,6 +39,15 @@ jobs:
         run: |
           pip install -r requirements.txt pytest cachetools
           pip install -e . --no-deps
+      - name: Stub dl_backtrace
+        run: |
+          mkdir -p "$RUNNER_TEMP/stubs/dl_backtrace"
+          for m in tf_backtrace pytorch_backtrace; do
+            mkdir -p "$RUNNER_TEMP/stubs/dl_backtrace/$m"
+            echo "Backtrace = object" > "$RUNNER_TEMP/stubs/dl_backtrace/$m/__init__.py"
+          done
+          touch "$RUNNER_TEMP/stubs/dl_backtrace/__init__.py"
+          echo "PYTHONPATH=$RUNNER_TEMP/stubs" >> "$GITHUB_ENV"
       - name: Test
         run: >
           pytest -q
