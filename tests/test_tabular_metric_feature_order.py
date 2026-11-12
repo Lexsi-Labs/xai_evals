@@ -54,6 +54,73 @@ class TestTabularMetricFeatureOrder(unittest.TestCase):
             self.metrics._feature_attributions(partial).tolist(), [0.0, 0.0, 1.0, 4.0]
         )
 
+    def test_features_missing_from_the_explanation_are_logged(self):
+        partial = pd.DataFrame({'Feature': ['f3', 'f2'], 'Attribution': [4.0, 1.0]})
+        with self.assertLogs('xai_evals.metrics', level='WARNING') as logs:
+            self.metrics._feature_attributions(partial)
+        self.assertIn('2 of 4 features are missing', logs.output[0])
+
+    def test_explanation_with_no_matching_feature_raises(self):
+        other = pd.DataFrame({'Feature': ['p', 'q'], 'Attribution': [1.0, 2.0]})
+        self.metrics.features = ['x', 'y']
+        with self.assertRaises(ValueError) as caught:
+            self.metrics._feature_attributions(other)
+        message = str(caught.exception)
+        self.assertIn("'p'", message)
+        self.assertIn("'x'", message)
+
+    def test_metrics_fail_on_an_unmatched_explanation_instead_of_scoring_zeros(self):
+        other = pd.DataFrame({'Feature': ['p', 'q', 'r', 's'], 'Attribution': self.coefficients})
+        with self.assertRaises(ValueError):
+            self.metrics._comprehensiveness([other], k=1)
+
+    def test_nan_attribution_is_not_turned_into_zero(self):
+        explanation = pd.DataFrame(
+            {'Feature': self.features, 'Attribution': [0.0, np.nan, 1.0, 4.0]}
+        )
+        values = self.metrics._feature_attributions(explanation)
+        self.assertTrue(np.isnan(values[1]))
+        self.assertEqual(values[[0, 2, 3]].tolist(), [0.0, 1.0, 4.0])
+
+    def test_names_that_collide_after_renaming_raise(self):
+        self.metrics.features = ['a b', 'a_b']
+        explanation = pd.DataFrame({'Feature': ['a b', 'a_b'], 'Attribution': [1.0, 2.0]})
+        with self.assertRaisesRegex(ValueError, 'must be unique'):
+            self.metrics._feature_attributions(explanation)
+
+    def test_duplicate_feature_names_raise_a_clear_error(self):
+        self.metrics.features = ['b', 'a', 'c']
+        explanation = pd.DataFrame({'Feature': ['a', 'b', 'a'], 'Attribution': [1.0, 2.0, 3.0]})
+        with self.assertRaisesRegex(ValueError, 'must be unique'):
+            self.metrics._feature_attributions(explanation)
+
+    def test_duplicate_column_names_raise_a_clear_error(self):
+        self.metrics.features = ['a', 'b', 'a']
+        explanation = pd.DataFrame({'Feature': ['a', 'b', 'a'], 'Attribution': [1.0, 2.0, 3.0]})
+        with self.assertRaisesRegex(ValueError, 'must be unique'):
+            self.metrics._feature_attributions(explanation)
+
+
+class TestNoiseSeed(unittest.TestCase):
+    def _metrics(self, random_state):
+        metrics = ExplanationMetricsTabular.__new__(ExplanationMetricsTabular)
+        metrics.random_state = random_state
+        return metrics
+
+    def test_same_seed_gives_the_same_noise(self):
+        first = self._metrics(7)._generate_noise((1, 5))
+        second = self._metrics(7)._generate_noise((1, 5))
+        np.testing.assert_array_equal(first, second)
+
+    def test_successive_draws_differ(self):
+        metrics = self._metrics(7)
+        self.assertFalse(np.array_equal(metrics._generate_noise((1, 5)), metrics._generate_noise((1, 5))))
+
+    def test_without_a_seed_runs_differ(self):
+        first = self._metrics(None)._generate_noise((1, 5))
+        second = self._metrics(None)._generate_noise((1, 5))
+        self.assertFalse(np.array_equal(first, second))
+
 
 if __name__ == "__main__":
     unittest.main()

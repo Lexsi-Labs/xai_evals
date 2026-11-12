@@ -37,6 +37,7 @@ class TestAggregateCachedResults(unittest.TestCase):
         ])
         self.assertAlmostEqual(results["Sparseness"], 0.6)
         self.assertAlmostEqual(results["Faithfulness"], 0.3)
+        self.assertEqual(results["num_batches"], 3)
 
     def test_nan_scores_across_metrics_do_not_divide_by_zero(self):
         results = self._aggregate([
@@ -46,10 +47,22 @@ class TestAggregateCachedResults(unittest.TestCase):
         ])
         self.assertAlmostEqual(results["Sparseness"], 0.6)
         self.assertAlmostEqual(results["Faithfulness"], 0.6)
+        self.assertEqual(results["num_batches"], 3)
+
+    def test_nan_in_one_sub_score_does_not_change_another(self):
+        results = self._aggregate([
+            {"MPRT": {"layer1": float("nan"), "layer2": 0.5}},
+            {"MPRT": {"layer1": 0.2, "layer2": 0.5}},
+            {"MPRT": {"layer1": 0.4, "layer2": 0.5}},
+        ])
+        self.assertAlmostEqual(results["MPRT_layer1"], 0.3)
+        self.assertAlmostEqual(results["MPRT_layer2"], 0.5)
+        self.assertEqual(results["num_batches"], 3)
 
     def test_metric_with_no_finite_score_is_left_out(self):
         results = self._aggregate([{"Sparseness": float("nan"), "Faithfulness": 0.6}])
         self.assertNotIn("Sparseness", results)
+        self.assertEqual(results["num_batches"], 1)
 
     def test_cache_files_are_deleted(self):
         self._aggregate([{"Faithfulness": 0.6}])

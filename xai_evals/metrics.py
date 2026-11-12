@@ -1,5 +1,6 @@
 import os
 import gc
+import logging
 import pickle
 import torch
 import quantus
@@ -17,6 +18,8 @@ from dl_backtrace.tf_backtrace import Backtrace as TFBacktrace
 from dl_backtrace.pytorch_backtrace import Backtrace as TorchBacktrace
 from xai_evals.utils import backtrace_quantus
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 class ExplanationMetricsImage:
     """
@@ -387,9 +390,13 @@ class ExplanationMetricsTabular:
                  start_idx=0, 
                  end_idx=None,
                  subset_samples=False,
-                 subset_number=100):
+                 subset_number=100,
+                 random_state=None):
         """
         Initialize ExplanationMetrics class.
+
+        `random_state` seeds the noise drawn by the infidelity and sensitivity metrics
+        (default None: a fresh, unseeded draw each run). It does not seed the explainers.
         
         - If explainer_name is 'shap' or 'lime', we assume a sklearn-like model.
         - If explainer_name is 'torch', 'tensorflow', or 'backtrace', we assume a deep learning model (TF or Torch).
@@ -422,6 +429,7 @@ class ExplanationMetricsTabular:
         self.thresholding = thresholding
         self.subset_samples = subset_samples
         self.subset_number = subset_number
+        self.random_state = random_state
 
         # Set default metrics if none provided
         self.metrics = metrics if metrics else [
@@ -603,14 +611,45 @@ class ExplanationMetricsTabular:
         return attributions_list
 
     def _generate_noise(self, shape, epsilon=1e-2):
-        return np.random.normal(0, epsilon, size=shape)
+        if getattr(self, '_rng', None) is None:
+            self._rng = np.random.default_rng(getattr(self, 'random_state', None))
+        return self._rng.normal(0, epsilon, size=shape)
 
     def _feature_attributions(self, attributions):
-        """Attributions in X_test column order; explainers rank their rows by importance."""
-        # SHAP and LIME rename spaces to underscores, and LIME only returns its top features.
+        """Attributions in X_test column order; explainers rank their rows by importance.
+
+        Features are matched by name. SHAP and LIME rename spaces to underscores, and
+        LIME only returns its top features, so a feature missing from the explanation
+        counts as 0. An explanation that shares no feature name with the data, or that
+        has repeated names, raises ValueError rather than being scored as all zeros.
+        NaN attributions are passed through unchanged.
+        """
         feature_names = pd.Series(self.features).str.replace(' ', '_')
         ranked = attributions.assign(Feature=attributions['Feature'].str.replace(' ', '_'))
-        return ranked.set_index('Feature')['Attribution'].reindex(feature_names).fillna(0).values
+        if feature_names.duplicated().any() or ranked['Feature'].duplicated().any():
+            repeated = sorted(set(feature_names[feature_names.duplicated()])
+                              | set(ranked['Feature'][ranked['Feature'].duplicated()]))
+            raise ValueError(
+                "Feature names must be unique to match explanations to data columns "
+                f"(spaces count as underscores); repeated: {repeated[:5]}"
+            )
+        explained = ranked.set_index('Feature')['Attribution']
+        found = feature_names.isin(explained.index)
+        if len(feature_names) and not found.any():
+            raise ValueError(
+                "None of the explanation's feature names match the data's columns. "
+                f"Explanation: {list(explained.index[:5])}; data: {list(feature_names[:5])}"
+            )
+        unmatched = len(explained) - int(found.sum())
+        if not found.all() or unmatched:
+            logger.warning(
+                "%d of %d features are missing from the explanation and count as 0 "
+                "attribution; %d explanation rows match no feature and are ignored.",
+                int((~found).sum()), len(feature_names), unmatched,
+            )
+        values = explained.reindex(feature_names)
+        values[~found.values] = 0.0
+        return values.values
 
     def _infidelity(self, attributions_list, epsilon=1e-2):
         infidelity_scores = []
