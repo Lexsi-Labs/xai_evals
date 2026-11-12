@@ -1,5 +1,6 @@
 import os
 import gc
+import logging
 import pickle
 import torch
 import quantus
@@ -17,6 +18,8 @@ from dl_backtrace.tf_backtrace import Backtrace as TFBacktrace
 from dl_backtrace.pytorch_backtrace import Backtrace as TorchBacktrace
 from xai_evals.utils import backtrace_quantus
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 class ExplanationMetricsImage:
     """
@@ -244,7 +247,7 @@ class ExplanationMetricsImage:
     def _aggregate_cached_results(self, cache_files):
         """Aggregates metric results from cached batch files and deletes them."""
         aggregated_scores = {}
-        nan_inf_value_count = 0
+        finite_batches = {}
 
         for cache_file in cache_files:
             with open(cache_file, "rb") as f:
@@ -252,28 +255,18 @@ class ExplanationMetricsImage:
 
             for metric_name, score in batch_results.items():
                 if isinstance(score, dict):
-                    for sub_key, sub_value in score.items():
-                        name_key = metric_name + "_" + sub_key
-                        if np.isfinite(sub_value):
-                            if name_key not in aggregated_scores:
-                                aggregated_scores[name_key] = 0.0
-                            else:
-                                aggregated_scores[name_key] += sub_value
-                        else:
-                            nan_inf_value_count+=1
+                    scores = {metric_name + "_" + sub_key: sub_value for sub_key, sub_value in score.items()}
                 else:
-                    if np.isfinite(score):
-                        if metric_name not in aggregated_scores:
-                            aggregated_scores[metric_name] = 0.0
-                        aggregated_scores[metric_name] += score
-                    else:
-                        nan_inf_value_count +=1
+                    scores = {metric_name: score}
+                for name_key, value in scores.items():
+                    if np.isfinite(value):
+                        aggregated_scores[name_key] = aggregated_scores.get(name_key, 0.0) + value
+                        finite_batches[name_key] = finite_batches.get(name_key, 0) + 1
 
-        num_batches = len(cache_files)-nan_inf_value_count
         for metric_name in aggregated_scores:
-            aggregated_scores[metric_name] /= num_batches
+            aggregated_scores[metric_name] /= finite_batches[metric_name]
 
-        aggregated_scores["num_batches"] = num_batches
+        aggregated_scores["num_batches"] = len(cache_files)
 
         # Delete cache files
         for cache_file in cache_files:
@@ -397,9 +390,13 @@ class ExplanationMetricsTabular:
                  start_idx=0, 
                  end_idx=None,
                  subset_samples=False,
-                 subset_number=100):
+                 subset_number=100,
+                 random_state=None):
         """
         Initialize ExplanationMetrics class.
+
+        `random_state` seeds the noise drawn by the infidelity and sensitivity metrics
+        (default None: a fresh, unseeded draw each run). It does not seed the explainers.
         
         - If explainer_name is 'shap' or 'lime', we assume a sklearn-like model.
         - If explainer_name is 'torch', 'tensorflow', or 'backtrace', we assume a deep learning model (TF or Torch).
@@ -432,6 +429,7 @@ class ExplanationMetricsTabular:
         self.thresholding = thresholding
         self.subset_samples = subset_samples
         self.subset_number = subset_number
+        self.random_state = random_state
 
         # Set default metrics if none provided
         self.metrics = metrics if metrics else [
@@ -613,19 +611,57 @@ class ExplanationMetricsTabular:
         return attributions_list
 
     def _generate_noise(self, shape, epsilon=1e-2):
-        return np.random.normal(0, epsilon, size=shape)
+        if getattr(self, '_rng', None) is None:
+            self._rng = np.random.default_rng(getattr(self, 'random_state', None))
+        return self._rng.normal(0, epsilon, size=shape)
+
+    def _feature_attributions(self, attributions):
+        """Attributions in X_test column order; explainers rank their rows by importance.
+
+        Features are matched by name. SHAP and LIME rename spaces to underscores, and
+        LIME only returns its top features, so a feature missing from the explanation
+        counts as 0. An explanation that shares no feature name with the data, or that
+        has repeated names, raises ValueError rather than being scored as all zeros.
+        NaN attributions are passed through unchanged.
+        """
+        feature_names = pd.Series(self.features).str.replace(' ', '_')
+        ranked = attributions.assign(Feature=attributions['Feature'].str.replace(' ', '_'))
+        if feature_names.duplicated().any() or ranked['Feature'].duplicated().any():
+            repeated = sorted(set(feature_names[feature_names.duplicated()])
+                              | set(ranked['Feature'][ranked['Feature'].duplicated()]))
+            raise ValueError(
+                "Feature names must be unique to match explanations to data columns "
+                f"(spaces count as underscores); repeated: {repeated[:5]}"
+            )
+        explained = ranked.set_index('Feature')['Attribution']
+        found = feature_names.isin(explained.index)
+        if len(feature_names) and not found.any():
+            raise ValueError(
+                "None of the explanation's feature names match the data's columns. "
+                f"Explanation: {list(explained.index[:5])}; data: {list(feature_names[:5])}"
+            )
+        unmatched = len(explained) - int(found.sum())
+        if not found.all() or unmatched:
+            logger.warning(
+                "%d of %d features are missing from the explanation and count as 0 "
+                "attribution; %d explanation rows match no feature and are ignored.",
+                int((~found).sum()), len(feature_names), unmatched,
+            )
+        values = explained.reindex(feature_names)
+        values[~found.values] = 0.0
+        return values.values
 
     def _infidelity(self, attributions_list, epsilon=1e-2):
         infidelity_scores = []
         for i in range(self.start_idx, self.end_idx):
             x = self.X_test[i:i+1]
             noise = self._generate_noise(x.shape, epsilon=epsilon)[0]
-            g_x = attributions_list[i - self.start_idx]['Attribution'].values
-            
+            g_x = self._feature_attributions(attributions_list[i - self.start_idx])
+
             f_x = self._predict(x)[0]
             f_x_pert = self._predict((x + noise))[0]
 
-            predicted_impact = np.dot(g_x[0], noise[0])
+            predicted_impact = np.dot(g_x, noise)
             actual_impact = f_x_pert - f_x
 
             infidelity_scores.append((predicted_impact - actual_impact)**2)
@@ -637,10 +673,10 @@ class ExplanationMetricsTabular:
             x = self.X_test[i:i+1]
             noise = self._generate_noise(x.shape, epsilon=epsilon)
             perturbed_x = (x + noise).astype(x.dtype)
-            old_attr = attributions_list[i - self.start_idx]['Attribution'].values
+            old_attr = self._feature_attributions(attributions_list[i - self.start_idx])
 
             new_explanation = self.explainer.explain(perturbed_x, instance_idx=0)
-            new_attr = new_explanation['Attribution'].values
+            new_attr = self._feature_attributions(new_explanation)
 
             sensitivity_scores.append(np.linalg.norm(old_attr - new_attr))
         return np.mean(sensitivity_scores)
@@ -648,7 +684,7 @@ class ExplanationMetricsTabular:
     def _comprehensiveness(self, attributions_list, k=5):
         comprehensiveness_scores = []
         for i in range(self.start_idx, self.end_idx):
-            attrs = attributions_list[i - self.start_idx]['Attribution'].values
+            attrs = self._feature_attributions(attributions_list[i - self.start_idx])
             top_k_indices = np.argsort(np.abs(attrs))[-k:]
 
             x = self.X_test[i].copy()
@@ -663,7 +699,7 @@ class ExplanationMetricsTabular:
     def _sufficiency(self, attributions_list, k=5):
         sufficiency_scores = []
         for i in range(self.start_idx, self.end_idx):
-            attrs = attributions_list[i - self.start_idx]['Attribution'].values
+            attrs = self._feature_attributions(attributions_list[i - self.start_idx])
             top_k_indices = np.argsort(np.abs(attrs))[-k:]
 
             x = self.X_test[i]
@@ -694,7 +730,7 @@ class ExplanationMetricsTabular:
         faithfulness_scores = []
         for i in range(self.start_idx, self.end_idx):
             f_x = self._predict(self.X_test[i:i+1])[0]
-            attribution_values = attributions_list[i - self.start_idx]['Attribution'].values
+            attribution_values = self._feature_attributions(attributions_list[i - self.start_idx])
 
             for j, a_j in enumerate(attribution_values):
                 x_pert = self.X_test[i].copy()
