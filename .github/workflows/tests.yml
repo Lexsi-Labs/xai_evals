@@ -4,12 +4,18 @@
 #   tests/test_metrics.py, tests/test_explainer.py - import the package
 #     `aryaxai_xai_metrics_tabular`, which no longer exists (now `xai_evals`).
 #
-# Stubbed: `dl_backtrace` (the installed release has no `tf_backtrace` module
-#   and its compiled CUDA extension fails to load against the pinned torch).
-#   The tests do not use it, so an empty stand-in package is put on PYTHONPATH.
-#
-# Extra install: `cachetools` is needed by quantus but missing from
-# requirements.txt, so it is installed here.
+# Stubbed: `dl_backtrace`. The release that requirements.txt installs (0.1.24)
+#   has no `tf_backtrace` module and exports `DLBacktrace`, not the `Backtrace`
+#   that xai_evals imports, and its compiled CUDA extensions target Python 3.10
+#   and 3.12 only, so `import xai_evals.metrics` fails against it. An empty
+#   stand-in package is put on PYTHONPATH so the tests can import the package.
+#   The "Check dl_backtrace imports" step runs before the stub and reports
+#   the real import result without failing the job.
+#   As a consequence, NONE of the three test files below covers any DlBacktrace
+#   code (tests/test_image_metric_aggregation.py, tests/test_tabular_metric_feature_order.py,
+#   tests/test_tabular_infidelity.py): `_evaluate_backtrace`,
+#   `DlBacktraceTabularExplainer` and `utils.backtrace_quantus` are untested.
+
 name: Tests
 
 on:
@@ -37,8 +43,18 @@ jobs:
           cache: pip
       - name: Install
         run: |
-          pip install -r requirements.txt pytest cachetools
+          pip install -r requirements.txt pytest
           pip install -e . --no-deps
+      - name: Check dl_backtrace imports (informational, never fails the job)
+        continue-on-error: true
+        run: |
+          status=0
+          for stmt in "import dl_backtrace" \
+                      "from dl_backtrace.tf_backtrace import Backtrace" \
+                      "from dl_backtrace.pytorch_backtrace import Backtrace"; do
+            if python -c "$stmt"; then echo "OK: $stmt"; else echo "FAILED: $stmt"; status=1; fi
+          done
+          exit $status
       - name: Stub dl_backtrace
         run: |
           mkdir -p "$RUNNER_TEMP/stubs/dl_backtrace"
